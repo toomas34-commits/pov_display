@@ -21,6 +21,13 @@ constexpr int16_t ANGLE_OFFSET_SLICES = 0;  // rotate image if needed
 constexpr uint8_t BRIGHTNESS = 72;
 constexpr EOrder COLOR_ORDER = BGR;  // SK9822 strips are often BGR
 
+// Geometry/aspect correction. A cylindrical POV has much more horizontal
+// "virtual width" (circumference) than vertical arm height, so without this
+// correction round shapes look stretched. Tune LED_VERTICAL_PITCH_MM if needed.
+constexpr float CYLINDER_DIAMETER_MM = 178.0f;
+constexpr float LED_VERTICAL_PITCH_MM = 5.5f; // center-to-center LED spacing
+constexpr float SMILEY_X_ASPECT_TRIM = 1.0f;  // 0.8..1.2 for fine tuning
+
 // Hall pulse limits for filtering noise and handling restarts.
 constexpr uint32_t MIN_HALF_PERIOD_US = 1500;      // reject bounce/noise
 constexpr uint32_t MAX_HALF_PERIOD_US = 2000000; // reject impossible slow edge
@@ -30,6 +37,7 @@ constexpr uint8_t MAX_MISSED_HALVES_BEFORE_BLANK = 8;
 CRGB leds[NUM_LEDS];
 float normX[ANGLE_SLICES];
 float normY[LEDS_PER_ARM];
+float g_smileyXScale = 1.0f;
 
 volatile uint32_t g_lastEdgeUs = 0;
 volatile uint32_t g_lastPulseUs = 0;
@@ -127,8 +135,17 @@ void precomputeCoordinates() {
   }
 }
 
+float computeSmileyXScale() {
+  const float circumferenceMm = PI * CYLINDER_DIAMETER_MM;
+  const float armHeightMm = (LEDS_PER_ARM - 1) * LED_VERTICAL_PITCH_MM;
+  if (armHeightMm <= 0.0f) {
+    return 1.0f;
+  }
+  return (circumferenceMm / armHeightMm) * SMILEY_X_ASPECT_TRIM;
+}
+
 CRGB smileyPixel(uint16_t slice, uint8_t y) {
-  const float x = normX[slice];
+  const float x = normX[slice] * g_smileyXScale;
   const float h = normY[y];
 
   const float faceRadius2 = x * x + h * h;
@@ -185,6 +202,7 @@ void setup() {
   FastLED.show();
 
   precomputeCoordinates();
+  g_smileyXScale = computeSmileyXScale();
 
   pinMode(HALL_PIN, INPUT_PULLUP);
   attachInterrupt(digitalPinToInterrupt(HALL_PIN), onHallEdge, FALLING);
