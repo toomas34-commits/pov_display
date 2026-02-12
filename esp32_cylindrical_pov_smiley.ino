@@ -25,6 +25,7 @@ constexpr EOrder COLOR_ORDER = BGR;  // SK9822 strips are often BGR
 constexpr uint32_t MIN_HALF_PERIOD_US = 1500;      // reject bounce/noise
 constexpr uint32_t MAX_HALF_PERIOD_US = 2000000; // reject impossible slow edge
 constexpr uint32_t MIN_SIGNAL_TIMEOUT_US = 400000;
+constexpr uint8_t MAX_MISSED_HALVES_BEFORE_BLANK = 8;
 
 CRGB leds[NUM_LEDS];
 float normX[ANGLE_SLICES];
@@ -63,6 +64,11 @@ void IRAM_ATTR onHallEdge() {
     return;  // debounce / EMI rejection
   }
 
+  // Ignore implausibly short intervals after lock (noise spikes).
+  if (g_syncedHalfTurns > 6 && (dt * 4U) < g_halfPeriodUs) {
+    return;
+  }
+
   if (dt > MAX_HALF_PERIOD_US) {
     // Lost lock (motor stopped or missed pulses). Re-lock from this new edge.
     g_lastEdgeUs = nowUs;
@@ -73,7 +79,15 @@ void IRAM_ATTR onHallEdge() {
   }
 
   // Low-pass filter half-turn duration so slice timing follows small RPM drift.
-  g_halfPeriodUs = (g_halfPeriodUs * 7U + dt) / 8U;
+  // If a pulse is delayed/missed, cap filter input to avoid large timing jumps.
+  uint32_t dtForFilter = dt;
+  if (g_syncedHalfTurns > 6) {
+    const uint32_t maxFilterDt = g_halfPeriodUs * 2U;
+    if (dtForFilter > maxFilterDt) {
+      dtForFilter = maxFilterDt;
+    }
+  }
+  g_halfPeriodUs = (g_halfPeriodUs * 7U + dtForFilter) / 8U;
   g_halfTurn ^= 1U;
   if (g_syncedHalfTurns < 0xFFFF) {
     g_syncedHalfTurns++;
@@ -182,22 +196,27 @@ void loop() {
 
   const uint32_t nowUs = micros();
   const uint32_t sincePulseUs = nowUs - lastPulseUs;
-  const uint32_t signalTimeoutUs = max(MIN_SIGNAL_TIMEOUT_US, halfPeriodUs * 3U);
+  const uint32_t signalTimeoutUs =
+      max(MIN_SIGNAL_TIMEOUT_US, halfPeriodUs * MAX_MISSED_HALVES_BEFORE_BLANK);
   if (sincePulseUs > signalTimeoutUs) {
     clearLedsIfNeeded();
     return;
   }
 
-  uint32_t elapsedInHalfUs = sincePulseUs;
-  if (elapsedInHalfUs > halfPeriodUs) {
-    elapsedInHalfUs = halfPeriodUs;
+  // Continue phase progression even if a pulse arrives late, so the image does
+  // not freeze into a bright block on one side of the cylinder.
+  const uint32_t elapsedHalves = sincePulseUs / halfPeriodUs;
+  const uint32_t elapsedInHalfUs = sincePulseUs - (elapsedHalves * halfPeriodUs);
+  uint8_t predictedHalfTurn = halfTurn;
+  if (elapsedHalves & 1U) {
+    predictedHalfTurn ^= 1U;
   }
 
   const uint16_t slicesPerHalf = ANGLE_SLICES / 2U;
   const uint16_t sliceWithinHalf =
       static_cast<uint16_t>((static_cast<uint64_t>(elapsedInHalfUs) * slicesPerHalf) /
                             halfPeriodUs);
-  uint16_t baseSlice = halfTurn ? slicesPerHalf : 0U;
+  uint16_t baseSlice = predictedHalfTurn ? slicesPerHalf : 0U;
   int32_t correctedSlice = static_cast<int32_t>(baseSlice + sliceWithinHalf) +
                            static_cast<int32_t>(ANGLE_OFFSET_SLICES);
   while (correctedSlice < 0) {
