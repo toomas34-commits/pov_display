@@ -78,9 +78,25 @@ void IRAM_ATTR onHallEdge() {
     return;
   }
 
+  // If dt is close to 2x/3x expected after lock, assume pulse(s) were skipped.
+  // This keeps half-period estimation stable and preserves phase continuity.
+  uint32_t halfStepsSinceLastPulse = 1U;
+  uint32_t dtForFilter = dt;
+  if (g_syncedHalfTurns > 6) {
+    const uint32_t expectedHalfUs = g_halfPeriodUs;
+    const uint32_t missedPulseThresholdUs = (expectedHalfUs * 7U) / 4U;
+    if (dt > missedPulseThresholdUs) {
+      const uint32_t estimatedSteps =
+          (dt + (expectedHalfUs / 2U)) / expectedHalfUs;  // nearest integer
+      if (estimatedSteps >= 2U && estimatedSteps <= 4U) {
+        halfStepsSinceLastPulse = estimatedSteps;
+        dtForFilter = dt / estimatedSteps;
+      }
+    }
+  }
+
   // Low-pass filter half-turn duration so slice timing follows small RPM drift.
   // If a pulse is delayed/missed, cap filter input to avoid large timing jumps.
-  uint32_t dtForFilter = dt;
   if (g_syncedHalfTurns > 6) {
     const uint32_t maxFilterDt = g_halfPeriodUs * 2U;
     if (dtForFilter > maxFilterDt) {
@@ -88,9 +104,11 @@ void IRAM_ATTR onHallEdge() {
     }
   }
   g_halfPeriodUs = (g_halfPeriodUs * 7U + dtForFilter) / 8U;
-  g_halfTurn ^= 1U;
-  if (g_syncedHalfTurns < 0xFFFF) {
-    g_syncedHalfTurns++;
+  g_halfTurn ^= (halfStepsSinceLastPulse & 1U);
+  if (g_syncedHalfTurns < (0xFFFF - halfStepsSinceLastPulse)) {
+    g_syncedHalfTurns += halfStepsSinceLastPulse;
+  } else {
+    g_syncedHalfTurns = 0xFFFF;
   }
 
   g_lastEdgeUs = nowUs;
