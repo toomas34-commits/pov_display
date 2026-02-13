@@ -21,12 +21,11 @@ constexpr int16_t ANGLE_OFFSET_SLICES = 0;  // rotate image if needed
 constexpr uint8_t BRIGHTNESS = 72;
 constexpr EOrder COLOR_ORDER = BGR;  // SK9822 strips are often BGR
 
-// Geometry/aspect correction. A cylindrical POV has much more horizontal
-// "virtual width" (circumference) than vertical arm height, so without this
-// correction round shapes look stretched. Tune LED_VERTICAL_PITCH_MM if needed.
-constexpr float CYLINDER_DIAMETER_MM = 178.0f;
-constexpr float LED_VERTICAL_PITCH_MM = 5.5f; // center-to-center LED spacing
-constexpr float SMILEY_X_ASPECT_TRIM = 1.0f;  // 0.8..1.2 for fine tuning
+// 3D ribbon effect tuning.
+constexpr float EFFECT_SPIN_HZ = 0.32f;          // global animation speed
+constexpr float HELIX_AMPLITUDE = 0.72f;         // vertical excursion
+constexpr uint8_t TRAIL_SAMPLES = 3;             // more = longer afterglow trail
+constexpr float TRAIL_ANGULAR_LAG_RAD = 0.18f;   // angular spacing between trail samples
 
 // Hall pulse limits for filtering noise and handling restarts.
 constexpr uint32_t MIN_HALF_PERIOD_US = 1500;      // reject bounce/noise
@@ -35,9 +34,8 @@ constexpr uint32_t MIN_SIGNAL_TIMEOUT_US = 400000;
 constexpr uint8_t MAX_MISSED_HALVES_BEFORE_BLANK = 8;
 
 CRGB leds[NUM_LEDS];
-float normX[ANGLE_SLICES];
+float g_sliceTheta[ANGLE_SLICES];
 float normY[LEDS_PER_ARM];
-float g_smileyXScale = 1.0f;
 
 volatile uint32_t g_lastEdgeUs = 0;
 volatile uint32_t g_lastPulseUs = 0;
@@ -125,8 +123,8 @@ void IRAM_ATTR onHallEdge() {
 
 void precomputeCoordinates() {
   for (uint16_t x = 0; x < ANGLE_SLICES; x++) {
-    const float t = static_cast<float>(x) / static_cast<float>(ANGLE_SLICES - 1);
-    normX[x] = t * 2.0f - 1.0f;
+    const float t = static_cast<float>(x) / static_cast<float>(ANGLE_SLICES);
+    g_sliceTheta[x] = t * TWO_PI;
   }
 
   for (uint16_t y = 0; y < LEDS_PER_ARM; y++) {
@@ -135,53 +133,62 @@ void precomputeCoordinates() {
   }
 }
 
-float computeSmileyXScale() {
-  const float circumferenceMm = PI * CYLINDER_DIAMETER_MM;
-  const float armHeightMm = (LEDS_PER_ARM - 1) * LED_VERTICAL_PITCH_MM;
-  if (armHeightMm <= 0.0f) {
-    return 1.0f;
-  }
-  return (circumferenceMm / armHeightMm) * SMILEY_X_ASPECT_TRIM;
+inline float gaussianFalloff(float delta, float width) {
+  const float safeWidth = fmaxf(width, 0.01f);
+  return expf(-(delta * delta) / (safeWidth * safeWidth));
 }
 
-CRGB smileyPixel(uint16_t slice, uint8_t y) {
-  const float x = normX[slice] * g_smileyXScale;
+CRGB helixPixel(uint16_t slice, uint8_t y, float phase) {
+  const float theta = g_sliceTheta[slice];
   const float h = normY[y];
 
-  const float faceRadius2 = x * x + h * h;
-  if (faceRadius2 > 1.0f) {
-    return CRGB::Black;
+  CRGB pixel = CRGB::Black;
+
+  for (uint8_t strand = 0; strand < 2; strand++) {
+    const float strandPhase = strand ? PI : 0.0f;
+    const float wavePhase = (2.0f * theta) + phase + strandPhase;
+    const float yCore = HELIX_AMPLITUDE * sinf(wavePhase);
+
+    // Depth term controls brightness and thickness for a stronger 3D look.
+    const float depth = 0.5f + 0.5f * cosf(theta + phase * 0.65f + strandPhase);
+    const float width = 0.05f + 0.13f * depth;
+
+    float intensity = gaussianFalloff(h - yCore, width) * (0.28f + 0.72f * depth);
+    for (uint8_t trail = 1; trail <= TRAIL_SAMPLES; trail++) {
+      const float lag = TRAIL_ANGULAR_LAG_RAD * static_cast<float>(trail);
+      const float trailTheta = theta - lag;
+      const float trailWave = (2.0f * trailTheta) + phase + strandPhase;
+      const float yTrail = HELIX_AMPLITUDE * sinf(trailWave);
+      const float trailDepth = 0.5f + 0.5f * cosf(trailTheta + phase * 0.65f + strandPhase);
+      const float trailWidth = 0.05f + 0.11f * trailDepth;
+      intensity += gaussianFalloff(h - yTrail, trailWidth) *
+                   (0.35f / static_cast<float>(trail)) *
+                   (0.20f + 0.80f * trailDepth);
+    }
+
+    intensity = fminf(intensity, 1.0f);
+    const uint8_t value = static_cast<uint8_t>(255.0f * intensity);
+    const uint8_t baseHue = strand ? 170 : 6;  // cyan + amber strands
+    const uint8_t hueDrift =
+        static_cast<uint8_t>(phase * 14.0f + depth * 24.0f);
+    pixel += ColorFromPalette(PartyColors_p, baseHue + hueDrift, value, LINEARBLEND);
   }
 
-  // Eyes
-  const float lx = x + 0.35f;
-  const float ly = h - 0.35f;
-  if ((lx * lx + ly * ly) < 0.020f) {
-    return CRGB::Black;
-  }
-
-  const float rx = x - 0.35f;
-  const float ry = h - 0.35f;
-  if ((rx * rx + ry * ry) < 0.020f) {
-    return CRGB::Black;
-  }
-
-  // Mouth arc (lower half ring segment).
-  const float my = h + 0.15f;
-  const float mouthR2 = x * x + my * my;
-  if (h < -0.05f && mouthR2 > 0.22f && mouthR2 < 0.34f) {
-    return CRGB::Black;
-  }
-
-  return CRGB(255, 185, 0);
+  // Dim center glow helps the helix feel volumetric while spinning.
+  const float centerBoost = 1.0f - fminf(fabsf(h), 1.0f);
+  const uint8_t ambience = static_cast<uint8_t>(centerBoost * 16.0f);
+  pixel += CRGB(0, ambience / 2U, ambience);
+  return pixel;
 }
 
-void renderSlice(uint16_t sliceA) {
+void renderSlice(uint16_t sliceA, uint32_t nowMs) {
   const uint16_t sliceB = (sliceA + ANGLE_SLICES / 2U) % ANGLE_SLICES;
+  const float phase =
+      fmodf((static_cast<float>(nowMs) * 0.001f) * TWO_PI * EFFECT_SPIN_HZ, TWO_PI);
 
   for (uint8_t y = 0; y < LEDS_PER_ARM; y++) {
-    leds[armAIndexFromBottom(y)] = smileyPixel(sliceA, y);
-    leds[armBIndexFromBottom(y)] = smileyPixel(sliceB, y);
+    leds[armAIndexFromBottom(y)] = helixPixel(sliceA, y, phase);
+    leds[armBIndexFromBottom(y)] = helixPixel(sliceB, y, phase);
   }
 }
 
@@ -202,7 +209,6 @@ void setup() {
   FastLED.show();
 
   precomputeCoordinates();
-  g_smileyXScale = computeSmileyXScale();
 
   pinMode(HALL_PIN, INPUT_PULLUP);
   attachInterrupt(digitalPinToInterrupt(HALL_PIN), onHallEdge, FALLING);
@@ -264,7 +270,8 @@ void loop() {
     return;
   }
 
-  renderSlice(displaySlice);
+  const uint32_t nowMs = nowUs / 1000U;
+  renderSlice(displaySlice, nowMs);
   FastLED.show();
   g_lastRenderedSlice = displaySlice;
   g_ledsAreCleared = false;
